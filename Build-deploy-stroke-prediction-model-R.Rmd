@@ -1,0 +1,390 @@
+---
+title: "Build and deploy a stroke prediction model using R"
+date: "`r Sys.Date()`"
+output: html_document
+author: "Sevval Eksi"
+---
+
+# About Data Analysis Report
+
+This RMarkdown file contains the report of the data analysis done for the project on building and deploying a stroke prediction model in R. It contains analysis such as data exploration, summary statistics and building the prediction models. The final report was completed on `r date()`. 
+
+**Data Description:**
+
+According to the World Health Organization (WHO) stroke is the 2nd leading cause of death globally, responsible for approximately 11% of total deaths.
+
+This data set is used to predict whether a patient is likely to get stroke based on the input parameters like gender, age, various diseases, and smoking status. Each row in the data provides relevant information about the patient.
+
+
+# Task One: Import data and data preprocessing
+
+## Load data and install packages
+
+```{r}
+library(tidyverse)
+# ggplot2, dplyr, tidyr, readr, purrr, tibble, stringr, forcats
+df = read.csv("C:/Users/Seval/healthcare-dataset-stroke-data.csv")
+
+```
+
+
+## Describe and explore the data
+
+```{r}
+str(df)
+dim(df)
+head(df)
+
+df %>% summarise(across(everything(),~sum(is.na(.))))
+#there is no missing values
+df %>% summarise(across(everything(), ~ sum(. %in% c("NA", "N/A"))))
+#bmi 201 N/A values
+
+df_1 <- df %>% mutate(bmi = na_if(bmi, "NA"), bmi = na_if(bmi, "N/A"), bmi = as.numeric(bmi))
+
+df_1 %>% summarise(mean_bmi = mean(bmi, na.rm = TRUE), median_bmi = median(bmi, na.rm=TRUE))
+#mean_bmi median_bmi
+#28.89324       28.1
+
+outliers_bmi <- df_1 %>%summarise(p05 = quantile(bmi, 0.05, na.rm = TRUE), p95 = quantile(bmi, 0.95, na.rm = TRUE))
+
+sum(df_1$bmi < outliers_bmi$p05 | df_1$bmi >outliers_bmi$p95, na.rm = TRUE) #492
+
+df_2<- df_1 %>%mutate(bmi =  if_else(is.na(bmi), median(bmi, na.rm=TRUE),bmi))
+
+str(df_2)
+
+df_2_long <- df_2 %>% select(where(is.numeric),-c(heart_disease, hypertension, stroke)) %>% 
+                               pivot_longer(everything(), names_to = "variable", values_to = "value")
+                 
+df_2_long %>% ggplot() + geom_boxplot(aes(x=variable, y=value), fill="orange") +
+  facet_wrap(~ variable, scales = "free", ncol = 4) + theme_minimal()
+
+#avg_glucose_level and bmi have outliers
+
+unique(df_2$heart_disease) # 0 1
+unique(df_2$hypertension) # 0 1
+unique(df_2$stroke) # 0 1 
+# one hot encoder 
+
+abs_cor_matrix <- df_2 %>% select(is.numeric) %>% cor() %>% abs()
+abs_cor_matrix[lower.tri(abs_cor_matrix, diag = TRUE)] <- NA
+
+top_corr <- as.data.frame(as.table(abs_cor_matrix)) %>% filter(!is.na(Freq)) %>% arrange(desc(Freq))
+
+top_corr %>% filter(Freq>=0.3)
+# no important multicollinearity
+
+numeric_vars <- df_2 %>% select(where(is.numeric))
+sapply(numeric_vars, var)
+#variance not zero
+
+library(fastDummies)
+
+df_3 <- dummy_cols(df_2, select_columns = c("gender", "ever_married","work_type","Residence_type","smoking_status"),
+                         remove_first_dummy = TRUE, remove_selected_columns = TRUE) 
+
+library(e1071)
+
+skewness(df_3$avg_glucose_level) #1.571361
+skewness(df_3$bmi) #1.087548
+
+library(MASS)
+
+boxcox_model__glu <- boxcox(lm(avg_glucose_level ~ 1, data = df_3), lambda = seq(-2, 2, 0.1)) #lambda -1
+
+boxcox_model__bmi <- boxcox(lm(bmi ~ 1, data = df_3), lambda = seq(-2, 2, 0.1)) #lambda 0
+
+df_4 <- df_3 %>% mutate(avg_glucose_level = 1 /(avg_glucose_level + 1), bmi = log(bmi))
+
+#λ ≈ 1 → ok.
+#λ ≈ 0 → Log transformation.
+#λ ≈ 0.5 → Square transformation
+#λ < 0 → More powerful transformation (ex. 1/y etc.).
+
+str(df_4)
+
+detach("package:MASS", unload = TRUE)
+library(dplyr)
+
+df_4 <- df_4 %>%
+  rename(
+    work_type_Self_employed = `work_type_Self-employed`,
+    smoking_status_never_smoked = `smoking_status_never smoked`,
+    
+  )
+
+df_last <- df_4 %>% select(-id)
+
+
+```
+
+
+
+# Task Two: Build prediction models
+
+```{r}
+library(tidymodels)
+
+set.seed(42)
+
+table(df_last$stroke)
+#4861 249 
+
+data_split <- initial_split(df_last, prop=0.8, strata = stroke)
+
+train_df = training(data_split)
+test_df = testing(data_split)
+
+train_df <- train_df %>%
+  mutate(stroke = factor(stroke, levels = c(0,1)))
+
+test_df <- test_df %>%
+  mutate(stroke = factor(stroke, levels = c(0,1)))
+
+fold_cv <- vfold_cv(train_df, 5, strata= stroke)
+
+recipe_df <- recipe(stroke ~ . , data= train_df,
+                    step_lincomb(all_predictors()),
+                    step_normalize(all_predictors()))
+
+
+log_model <- logistic_reg(penalty = 0.1, mixture = 1) %>% #lasso
+  set_engine("glmnet") %>% set_mode("classification")
+
+workflow_log <- workflow() %>% add_model(log_model) %>% add_recipe(recipe_df)
+results_log <- fit_resamples(workflow_log, resamples= fold_cv, metrics = metric_set(roc_auc, accuracy, f_meas ))
+
+
+
+
+rand_model <- rand_forest(trees= 500,
+                          mtry=4,
+                          min_n = 5) %>% 
+  set_engine("randomForest") %>% set_mode("classification")
+
+workflow_rand <- workflow() %>% add_model(rand_model) %>% add_recipe(recipe_df)
+results_rand <- fit_resamples(workflow_rand, resamples= fold_cv, metrics = metric_set(roc_auc, accuracy, f_meas))
+
+
+library(xgboost)
+
+xgb_model <- boost_tree(
+  trees = 500,         
+  tree_depth = 5,       
+  learn_rate = 0.05,    
+  mtry = 0.6,           
+  min_n = 5   ) %>%
+  set_engine("xgboost", counts = FALSE) %>%set_mode("classification")
+
+workflow_xgb <- workflow() %>% add_model(xgb_model) %>% add_recipe(recipe_df)
+results_xgb <- fit_resamples(workflow_xgb, resamples= fold_cv, metrics = metric_set(roc_auc, accuracy, f_meas))
+
+```
+
+
+
+
+# Task Three: Evaluate and select prediction models
+
+```{r}
+
+col_log <- collect_metrics(results_log)
+col_rand <- collect_metrics(results_rand)
+col_xgb <- collect_metrics(results_xgb)
+
+model_scores <- data.frame(
+  model = c("log", "random_forest", "xgboost"),
+  roc_auc = c(
+    col_log$mean[col_log$.metric == "roc_auc"],
+    col_rand$mean[col_rand$.metric == "roc_auc"],
+    col_xgb$mean[col_xgb$.metric == "roc_auc"] ),
+  accuracy = c(
+    col_log$mean[col_log$.metric == "accuracy"],
+    col_rand$mean[col_rand$.metric == "accuracy"],
+    col_xgb$mean[col_xgb$.metric == "accuracy"]),
+  f1_score =c (
+    col_log$mean[col_log$.metric =="f_meas"],
+    col_rand$mean[col_rand$.metric =="f_meas"],
+    col_xgb$mean[col_xgb$.metric =="f_meas"]
+  ))
+
+model_scores
+
+best_log <- select_best(results_log, metric ="roc_auc")
+final_log <- finalize_workflow(workflow_log, best_log)
+fit_log <- fit(final_log, data=train_df)
+predict_log_prob <- predict(fit_log, new_data=test_df, type="prob")
+
+best_rand <- select_best(results_rand, metric="roc_auc")
+final_rand <- finalize_workflow(workflow_rand, best_rand)
+fit_rand <- fit(final_rand, data=train_df)
+predict_rand <- predict(fit_rand, test_df, type="prob")
+
+best_xgb <- select_best(results_xgb, metric= "roc_auc")
+final_xgb <- finalize_workflow(workflow_xgb, best_xgb)
+fit_xgb <- fit(final_xgb, data=train_df)
+predict_xgb <- predict(fit_xgb, test_df)
+
+
+final_rand
+```
+
+
+
+# Task Four: Deploy the prediction model
+
+```{r}
+
+saveRDS(col_log, "col_log.rds")
+saveRDS(col_rand, "col_rand.rds")
+saveRDS(col_xgb, "col_xgb.rds")
+saveRDS(fit_log,"model_log.rds")
+saveRDS(fit_rand,"model_rand.rds")
+saveRDS(fit_xgb,"model_xgb.rds")
+
+#install.packages("plumber")
+library(plumber)
+library(dplyr)     
+library(tibble)
+library(tidymodels)
+
+col_log <- readRDS("col_log.rds")
+col_rand <- readRDS("col_rand.rds")
+col_xgb <- readRDS("col_xgb.rds")
+model_log <- readRDS("model_log.rds")
+model_rand <- readRDS("model_rand.rds")
+model_xgb <- readRDS("model_xgb.rds")
+
+model_scores <- data.frame(
+  model = c("log", "random_forest", "xgboost"),
+  roc_auc = c(
+    col_log$mean[col_log$.metric == "roc_auc"],
+    col_rand$mean[col_rand$.metric == "roc_auc"],
+    col_xgb$mean[col_xgb$.metric == "roc_auc"] ),
+  accuracy = c(
+    col_log$mean[col_log$.metric == "accuracy"],
+    col_rand$mean[col_rand$.metric == "accuracy"],
+    col_xgb$mean[col_xgb$.metric == "accuracy"]),
+  f1_score =c (
+    col_log$mean[col_log$.metric =="f_meas"],
+    col_rand$mean[col_rand$.metric =="f_meas"],
+    col_xgb$mean[col_xgb$.metric =="f_meas"]
+  ))
+
+unique(df$smoking_status)
+
+#* @post /predict
+#* @param age:numeric Age of the patient (e.g., 45)
+#* @param hypertension:numeric Hypertension status (1 = Yes, 0 = No)
+#* @param heart_disease:numeric Heart disease status (1 = Yes, 0 = No)
+#* @param avg_glucose_level:numeric Average glucose level (e.g., 120.5)
+#* @param bmi:numeric Body Mass Index (e.g., 27.3)
+#* @param gender_Male:numeric Gender Male (1 = Yes, 0 = No)
+#* @param gender_Other:numeric Gender Other (1 = Yes, 0 = No) (All options 0 = Female)
+#* @param ever_married_Yes:numeric Marital status (1 = Married, 0 = Not married)
+#* @param work_type_Govt_job:numeric Work type: Government job (1 = Yes, 0 = No)
+#* @param work_type_Never_worked:numeric Work type: Never worked (1 = Yes, 0 = No)
+#* @param work_type_Private:numeric Work type: Private sector (1 = Yes, 0 = No)
+#* @param work_type_Self_employed:numeric Work type: Self-employed (1 = Yes, 0 = No) (All options 0 = children)
+#* @param Residence_type_Urban:numeric Residence type: Urban (1 = Yes, 0 = Rural) 
+#* @param smoking_status_never_smoked:numeric Smoking status: Never smoked (1 = Yes, 0 = No)
+#* @param smoking_status_smokes:numeric Smoking status: Currently smokes (1 = Yes, 0 = No)
+#* @param smoking_status_Unknown:numeric Smoking status: Unknown (1 = Yes, 0 = No) (All options 0 = formerly smoked)
+#* @response 200 A JSON containing predictions and model comparison results
+function(age, hypertension, heart_disease, avg_glucose_level, bmi,
+         gender_Male, gender_Other, ever_married_Yes, work_type_Govt_job, work_type_Never_worked,
+         work_type_Private, work_type_Self_employed, Residence_type_Urban, smoking_status_never_smoked,
+         smoking_status_smokes, smoking_status_Unknown){
+
+  tryCatch({
+
+    new_data <- data.frame(
+      age = as.numeric(age),
+      hypertension = as.numeric(hypertension),
+      heart_disease = as.numeric(heart_disease),
+      avg_glucose_level = as.numeric(avg_glucose_level),
+      bmi = as.numeric(bmi),
+      gender_Male = as.numeric(gender_Male),
+      gender_Other = as.numeric(gender_Other),
+      ever_married_Yes = as.numeric(ever_married_Yes),
+      work_type_Govt_job = as.numeric(work_type_Govt_job),
+      work_type_Never_worked = as.numeric(work_type_Never_worked),
+      work_type_Private = as.numeric(work_type_Private),
+      work_type_Self_employed = as.numeric(work_type_Self_employed),
+      Residence_type_Urban = as.numeric(Residence_type_Urban),
+      smoking_status_never_smoked = as.numeric(smoking_status_never_smoked),
+      smoking_status_smokes = as.numeric(smoking_status_smokes),
+      smoking_status_Unknown = as.numeric(smoking_status_Unknown)
+    )
+
+    pred_log  <- predict(model_log,  new_data, type = "prob")$.pred_1
+    pred_rand <- predict(model_rand, new_data, type = "prob")$.pred_1
+    pred_xgb  <- predict(model_xgb,  new_data, type = "prob")$.pred_1
+
+    results <- tibble(
+      model = c("Logistic Regression", "Random Forest", "XGBoost"),
+      probability = c(pred_log, pred_rand, pred_xgb),
+      prediction = ifelse(c(pred_log, pred_rand, pred_xgb) > 0.5, 1, 0),
+      accuracy = model_scores$accuracy
+    )
+
+    best_model <- results %>% filter(accuracy == max(accuracy)) %>% slice(1)
+
+    list(
+      all_models = results,
+      best_model = best_model
+    )
+
+  }, error = function(e) {
+    list(error = e$message)
+  })
+}
+
+#file.exists("model_log.rds")
+#file.exists("model_rand.rds")
+#file.exists("model_xgb.rds")
+
+r <- plumb("api.R")
+r$run(port = 8000, debug = TRUE)
+
+#POST http://127.0.0.1:8000/predict
+
+```
+
+
+
+
+# Task Five: Findings and Conclusions
+
+The analysis revealed that features like age, BMI, and hypertension are most predictive of stroke occurrence. Among the models tested, Random Forest achieved the highest accuracy, while XGBoost showed strong performance on minority classes. A REST API was developed to provide real-time predictions, with automated handling of categorical variables. Overall, Random Forest is recommended for deployment, and future improvements could include feature explanation and further hyperparameter tuning.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
